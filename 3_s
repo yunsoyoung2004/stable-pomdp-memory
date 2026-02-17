@@ -1,0 +1,962 @@
+# ============================================================
+# Tree-Based Actor-Critic (CartPole)
+# + Spike(v5: LEVEL+JUMP)  [UNCHANGED]
+# + Collapse(v8: PeakDrawdown + TrimmedRobust, NO spike-suppress)
+# + Reward Polarity Shaping (NEW, smaller weight than collapse/spike)
+#   -> if episode reward is negative: mild exploration boost
+#   -> if episode reward is positive: mild exploitation (slight decay)
+#   -> collapse/spike_down still dominate (big boost as before)
+# ============================================================
+
+import math
+import random
+from collections import defaultdict, deque
+
+import numpy as np
+
+try:
+    import gymnasium as gym
+    GYMNASIUM = True
+except ImportError:
+    import gym
+    GYMNASIUM = False
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# -----------------------------
+# Utils
+# -----------------------------
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def safe_reset(env, seed=None):
+    if GYMNASIUM:
+        obs, info = env.reset(seed=seed)
+        return obs
+    else:
+        if seed is not None:
+            try:
+                env.seed(seed)
+            except Exception:
+                pass
+        obs = env.reset()
+        return obs
+
+def safe_step(env, action):
+    if GYMNASIUM:
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        return obs, reward, done
+    else:
+        obs, reward, done, info = env.step(action)
+        return obs, reward, done
+
+
+# ============================================================
+# 1) Decision Tree Memory (action-sequence tree)
+# ============================================================
+class TreeNode:
+    def __init__(self, depth, parent=None, action=None):
+        self.depth = depth
+        self.parent = parent
+        self.action = action
+        self.children = {}
+        self.visit_count = 0
+        self.value_sum = 0.0
+
+    def add_child(self, action):
+        child = TreeNode(depth=self.depth + 1, parent=self, action=action)
+        self.children[action] = child
+        return child
+
+    def update(self, G):
+        self.visit_count += 1
+        self.value_sum += float(G)
+
+    def avg_value(self):
+        return self.value_sum / max(1, self.visit_count)
+
+
+class DecisionTree:
+    def __init__(self, max_depth=200):
+        self.root = TreeNode(depth=0)
+        self.max_depth = max_depth
+        self.nodes_by_depth = defaultdict(list)
+        self.nodes_by_depth[0].append(self.root)
+
+    def get_or_create_child(self, node, action):
+        if action not in node.children:
+            child = node.add_child(action)
+            self.nodes_by_depth[child.depth].append(child)
+        return node.children[action]
+
+    def record_episode(self, actions):
+        node = self.root
+        path = [node]
+        for t, a in enumerate(actions):
+            if t >= self.max_depth:
+                break
+            node = self.get_or_create_child(node, int(a))
+            path.append(node)
+        return path
+
+    def update_path_with_returns(self, path_nodes, returns):
+        for d, node in enumerate(path_nodes):
+            t = min(d, len(returns) - 1)
+            node.update(returns[t])
+
+    def stats(self):
+        total_nodes = sum(len(v) for v in self.nodes_by_depth.values())
+        max_depth_used = max(self.nodes_by_depth.keys()) if self.nodes_by_depth else 0
+        return {"total_nodes": total_nodes, "max_depth": max_depth_used}
+
+
+# ============================================================
+# 2) Collapse Detector v8 (PeakDrawdown + TrimmedRobust)
+# ============================================================
+class CollapseDetectorV8:
+    def __init__(
+        self,
+        window_size=40,
+        min_episodes=20,
+        last_k=3,
+
+        # trimming
+        trim_q=10,
+
+        # drawdown collapse (main)
+        peak_percentile=90,
+        peak_min=60.0,
+        dd_ratio=0.35,
+        dd_abs_min=35.0,
+
+        # immediate crash
+        delta_window=30,
+        delta_dyn_mult=1.2,
+        delta_abs_min=18.0,
+        low_percentile=30,
+
+        # persistent low
+        persist_frac=0.45,
+        dynabs_mult=2.2,
+        abs_min=10.0,
+        consecutive=1,
+
+        # metric only
+        ewma_alpha=0.15,
+    ):
+        self.window_size = window_size
+        self.min_episodes = min_episodes
+        self.last_k = last_k
+
+        self.trim_q = trim_q
+
+        self.peak_percentile = peak_percentile
+        self.peak_min = peak_min
+        self.dd_ratio = dd_ratio
+        self.dd_abs_min = dd_abs_min
+
+        self.delta_window = delta_window
+        self.delta_dyn_mult = delta_dyn_mult
+        self.delta_abs_min = delta_abs_min
+        self.low_percentile = low_percentile
+
+        self.persist_frac = persist_frac
+        self.dynabs_mult = dynabs_mult
+        self.abs_min = abs_min
+        self.consecutive = consecutive
+
+        self.ewma_alpha = ewma_alpha
+
+        self.recent = deque(maxlen=window_size)
+        self.recent_deltas = deque(maxlen=delta_window)
+
+        self.episode_count = 0
+        self.all_time_avg = 0.0
+
+        self.ewma = None
+        self.best_ewma = -1e9
+
+        self.bad_streak = 0
+        self.last_reason = "NONE"
+
+        self._prev_r = None
+
+        self.debug = {
+            "peak": 0.0,
+            "dd": 0.0,
+            "base_med": 0.0,
+            "dyn_abs": 0.0,
+            "p_low": 0.0,
+            "delta_thr": 0.0,
+        }
+
+    @staticmethod
+    def _robust_sigma(x: np.ndarray) -> float:
+        med = float(np.median(x))
+        mad = float(np.median(np.abs(x - med)))
+        return float(1.4826 * mad + 1e-6)
+
+    def _trim(self, arr: np.ndarray) -> np.ndarray:
+        if arr.size < 10:
+            return arr
+        lo = np.percentile(arr, self.trim_q)
+        hi = np.percentile(arr, 100 - self.trim_q)
+        trimmed = arr[(arr >= lo) & (arr <= hi)]
+        return trimmed if trimmed.size >= 5 else arr
+
+    def update(self, reward: float):
+        r = float(reward)
+        if self._prev_r is not None:
+            self.recent_deltas.append(r - self._prev_r)
+        self._prev_r = r
+
+        self.recent.append(r)
+        self.episode_count += 1
+        self.all_time_avg = (self.all_time_avg * (self.episode_count - 1) + r) / self.episode_count
+
+        if self.ewma is None:
+            self.ewma = r
+        else:
+            self.ewma = (1.0 - self.ewma_alpha) * self.ewma + self.ewma_alpha * r
+        self.best_ewma = max(self.best_ewma, self.ewma)
+
+    def get_stability(self):
+        if len(self.recent) < 2:
+            return 1.0
+        arr = np.array(self.recent, dtype=np.float32)
+        mu = float(np.mean(arr))
+        sd = float(np.std(arr))
+        return 1.0 / (1.0 + sd / (mu + 1e-6))
+
+    def _delta_threshold(self):
+        if len(self.recent_deltas) < max(10, self.delta_window // 2):
+            return self.delta_abs_min
+        d = np.array(self.recent_deltas, dtype=np.float32)
+        sig_d = self._robust_sigma(d)
+        thr = max(self.delta_abs_min, self.delta_dyn_mult * sig_d)
+        return float(thr)
+
+    def detect(self):
+        self.last_reason = "NONE"
+        self.debug = {k: 0.0 for k in self.debug}
+
+        if self.episode_count < self.min_episodes or len(self.recent) < max(12, self.last_k + 6):
+            self.bad_streak = 0
+            return False
+
+        arr = np.array(self.recent, dtype=np.float32)
+        last = float(arr[-1])
+        prev = float(arr[-2]) if arr.size >= 2 else last
+        delta = last - prev
+
+        base = arr[:-1] if arr.size >= 2 else arr
+        base_t = self._trim(base)
+
+        base_med = float(np.median(base_t))
+        sig = self._robust_sigma(base_t)
+        dyn_abs = max(self.abs_min, self.dynabs_mult * sig)
+
+        peak = float(np.percentile(arr, self.peak_percentile))
+        dd = peak - last
+
+        p_low = float(np.percentile(base_t, self.low_percentile))
+        delta_thr = self._delta_threshold()
+
+        self.debug.update({
+            "peak": peak,
+            "dd": dd,
+            "base_med": base_med,
+            "dyn_abs": dyn_abs,
+            "p_low": p_low,
+            "delta_thr": delta_thr,
+        })
+
+        drawdown_collapse = (
+            (peak >= self.peak_min) and
+            (last <= peak * self.dd_ratio) and
+            (dd >= self.dd_abs_min) and
+            (delta <= 0.0)
+        )
+        if drawdown_collapse:
+            self.bad_streak = self.consecutive
+            self.last_reason = f"Collapse:Drawdown(P{self.peak_percentile}, peak={peak:.1f}, last={last:.1f})"
+            return True
+
+        immediate_crash = (delta <= -delta_thr) and (last <= p_low)
+        if immediate_crash:
+            self.bad_streak = self.consecutive
+            self.last_reason = f"Collapse:ImmediateCrash(d<={-delta_thr:.1f}, last<=P{self.low_percentile})"
+            return True
+
+        avg_k = float(np.mean(arr[-self.last_k:]))
+        persistent = (base_med - avg_k) >= (self.persist_frac * dyn_abs)
+
+        if persistent:
+            self.bad_streak += 1
+            self.last_reason = f"PersistentLow(avg{self.last_k})"
+        else:
+            self.bad_streak = 0
+            self.last_reason = "NONE"
+
+        collapsed = (self.bad_streak >= self.consecutive)
+        if collapsed:
+            self.last_reason = f"Collapse:PersistentLow(avg{self.last_k})"
+        return collapsed
+
+
+# ============================================================
+# 3) Spike Detector (v5: LEVEL + JUMP)  [UNCHANGED]
+# ============================================================
+class SpikeDetectorV5:
+    def __init__(
+        self,
+        window=25,
+        min_n=10,
+
+        # LEVEL
+        zR_level=2.6,
+        abs_level_min=18.0,
+        rel_level=0.40,
+
+        # JUMP
+        zR_jump=2.1,
+        zD_jump=1.4,
+        abs_delta_min=10.0,
+        dyn_mult_delta=1.4,
+        cap_delta=35.0,
+
+        # DOWN symmetric
+        zR_level_dn=2.6,
+        abs_level_min_dn=18.0,
+        rel_level_dn=0.40,
+        zR_jump_dn=2.1,
+        zD_jump_dn=1.4,
+        abs_delta_min_dn=10.0,
+        dyn_mult_delta_dn=1.4,
+        cap_delta_dn=35.0,
+
+        use_percentile_guard=True,
+        p_hi=95,
+        p_lo=5,
+    ):
+        self.window = window
+        self.min_n = min_n
+
+        self.zR_level = zR_level
+        self.abs_level_min = abs_level_min
+        self.rel_level = rel_level
+
+        self.zR_jump = zR_jump
+        self.zD_jump = zD_jump
+        self.abs_delta_min = abs_delta_min
+        self.dyn_mult_delta = dyn_mult_delta
+        self.cap_delta = cap_delta
+
+        self.zR_level_dn = zR_level_dn
+        self.abs_level_min_dn = abs_level_min_dn
+        self.rel_level_dn = rel_level_dn
+
+        self.zR_jump_dn = zR_jump_dn
+        self.zD_jump_dn = zD_jump_dn
+        self.abs_delta_min_dn = abs_delta_min_dn
+        self.dyn_mult_delta_dn = dyn_mult_delta_dn
+        self.cap_delta_dn = cap_delta_dn
+
+        self.use_percentile_guard = use_percentile_guard
+        self.p_hi = p_hi
+        self.p_lo = p_lo
+
+        self.rewards = []
+
+    @staticmethod
+    def _robust_stats(x: np.ndarray):
+        med = float(np.median(x))
+        mad = float(np.median(np.abs(x - med)))
+        sig = float(1.4826 * mad + 1e-6)
+        return med, sig
+
+    def update(self, reward: float):
+        self.rewards.append(float(reward))
+        if len(self.rewards) > self.window:
+            self.rewards.pop(0)
+
+    def detect(self):
+        out = {
+            "is_spike_up": False,
+            "is_spike_down": False,
+            "kind": "NONE",
+            "z_r": 0.0,
+            "z_d": 0.0,
+            "delta": 0.0,
+            "base_med": 0.0,
+            "sigma_r": 0.0,
+            "sigma_d": 0.0,
+            "dyn_abs_delta": 0.0,
+            "p_hi_val": 0.0,
+            "p_lo_val": 0.0,
+        }
+
+        if len(self.rewards) < self.min_n:
+            return out
+
+        last = float(self.rewards[-1])
+        prev = float(self.rewards[-2]) if len(self.rewards) >= 2 else last
+        delta = last - prev
+
+        base = np.array(self.rewards[:-1], dtype=np.float32)
+        if base.shape[0] < self.min_n - 1:
+            return out
+
+        med_r, sig_r = self._robust_stats(base)
+        z_r = (last - med_r) / sig_r
+
+        if base.shape[0] >= 2:
+            deltas = base[1:] - base[:-1]
+            med_d, sig_d = self._robust_stats(deltas)
+            z_d = (delta - med_d) / sig_d
+        else:
+            sig_d = 1.0
+            z_d = 0.0
+
+        p_hi_val = float(np.percentile(base, self.p_hi)) if self.use_percentile_guard else 0.0
+        p_lo_val = float(np.percentile(base, self.p_lo)) if self.use_percentile_guard else 0.0
+
+        level_abs = (last - med_r)
+        level_thr = max(self.abs_level_min, self.rel_level * max(1.0, abs(med_r)))
+        up_level = (z_r >= self.zR_level) and (level_abs >= level_thr)
+        if self.use_percentile_guard:
+            up_level = up_level and (last >= p_hi_val)
+
+        level_abs_dn = (med_r - last)
+        level_thr_dn = max(self.abs_level_min_dn, self.rel_level_dn * max(1.0, abs(med_r)))
+        dn_level = ((-z_r) >= self.zR_level_dn) and (level_abs_dn >= level_thr_dn)
+        if self.use_percentile_guard:
+            dn_level = dn_level and (last <= p_lo_val)
+
+        dyn_abs_delta = min(self.cap_delta, self.dyn_mult_delta * float(sig_d))
+        dyn_abs_delta = max(float(self.abs_delta_min), float(dyn_abs_delta))
+        up_jump = (z_r >= self.zR_jump) and (z_d >= self.zD_jump) and (delta >= dyn_abs_delta)
+
+        dyn_abs_delta_dn = min(self.cap_delta_dn, self.dyn_mult_delta_dn * float(sig_d))
+        dyn_abs_delta_dn = max(float(self.abs_delta_min_dn), float(dyn_abs_delta_dn))
+        dn_jump = ((-z_r) >= self.zR_jump_dn) and ((-z_d) >= self.zD_jump_dn) and ((-delta) >= dyn_abs_delta_dn)
+
+        is_up = bool(up_level or up_jump)
+        is_dn = bool(dn_level or dn_jump)
+
+        kind = "NONE"
+        if is_up:
+            kind = "UP_LEVEL" if up_level else "UP_JUMP"
+        if is_dn:
+            kind = "DN_LEVEL" if dn_level else "DN_JUMP"
+
+        out.update({
+            "is_spike_up": is_up,
+            "is_spike_down": is_dn,
+            "kind": kind,
+            "z_r": float(z_r),
+            "z_d": float(z_d),
+            "delta": float(delta),
+            "base_med": float(med_r),
+            "sigma_r": float(sig_r),
+            "sigma_d": float(sig_d),
+            "dyn_abs_delta": float(dyn_abs_delta),
+            "p_hi_val": float(p_hi_val),
+            "p_lo_val": float(p_lo_val),
+        })
+        return out
+
+
+# ============================================================
+# 4) Networks
+# ============================================================
+class PolicyNetwork(nn.Module):
+    def __init__(self, obs_dim=4, act_dim=2, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, act_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ValueNetwork(nn.Module):
+    def __init__(self, obs_dim=4, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+# ============================================================
+# 5) Trainer
+# ============================================================
+class TreeBasedPolicyTrainer:
+    def __init__(
+        self,
+        policy, value, policy_optim, value_optim, device,
+        tree_depth=200,
+        gamma=0.99,
+        entropy_coef=0.01,
+        value_coef=0.5,
+        ucb_c=1.5,
+        ucb_mix=0.35,
+        max_steps=500,
+
+        # strong (collapse/spike) recovery
+        crash_boost_steps=3,
+        ucb_mix_boost=0.25,
+        entropy_boost=0.02,
+
+        # NEW: mild reward polarity shaping (smaller weight than collapse/spike)
+        reward_shape_enable=True,
+        reward_shape_window=30,
+        reward_shape_min_episodes=10,
+        reward_shape_strength=0.25,   # global multiplier (keep small)
+        reward_neg_ucb_boost=0.10,    # applied * reward_shape_strength
+        reward_neg_entropy_boost=0.008,
+        reward_pos_ucb_decay=0.06,    # applied * reward_shape_strength
+        reward_pos_entropy_decay=0.004,
+    ):
+        self.policy = policy
+        self.value = value
+        self.policy_optim = policy_optim
+        self.value_optim = value_optim
+        self.device = device
+
+        self.gamma = gamma
+        self.base_entropy_coef = entropy_coef
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+
+        self.tree = DecisionTree(max_depth=tree_depth)
+        self.ucb_c = ucb_c
+        self.base_ucb_mix = ucb_mix
+        self.ucb_mix = ucb_mix
+        self.max_steps = max_steps
+
+        self.collapse_detector = CollapseDetectorV8(
+            window_size=40,
+            min_episodes=20,
+            last_k=3,
+            trim_q=10,
+
+            peak_percentile=90,
+            peak_min=60.0,
+            dd_ratio=0.35,
+            dd_abs_min=35.0,
+
+            delta_window=30,
+            delta_dyn_mult=1.2,
+            delta_abs_min=18.0,
+            low_percentile=30,
+
+            persist_frac=0.45,
+            dynabs_mult=2.2,
+            abs_min=10.0,
+            consecutive=1,
+
+            ewma_alpha=0.15
+        )
+
+        self.spike_detector = SpikeDetectorV5(
+            window=25,
+            min_n=10,
+            zR_level=2.6,
+            abs_level_min=18.0,
+            rel_level=0.40,
+            zR_jump=2.1,
+            zD_jump=1.4,
+            abs_delta_min=10.0,
+            dyn_mult_delta=1.4,
+            cap_delta=35.0,
+            use_percentile_guard=True,
+            p_hi=95,
+            p_lo=5,
+        )
+
+        # strong recovery knobs (dominant)
+        self.recovery_left = 0
+        self.crash_boost_steps = crash_boost_steps
+        self.ucb_mix_boost = ucb_mix_boost
+        self.entropy_boost = entropy_boost
+
+        # mild reward polarity shaping knobs (sub-dominant)
+        self.reward_shape_enable = bool(reward_shape_enable)
+        self.reward_shape_window = int(reward_shape_window)
+        self.reward_shape_min_episodes = int(reward_shape_min_episodes)
+        self.reward_shape_strength = float(reward_shape_strength)
+
+        self.reward_neg_ucb_boost = float(reward_neg_ucb_boost)
+        self.reward_neg_entropy_boost = float(reward_neg_entropy_boost)
+        self.reward_pos_ucb_decay = float(reward_pos_ucb_decay)
+        self.reward_pos_entropy_decay = float(reward_pos_entropy_decay)
+
+        self._ep_rewards = deque(maxlen=self.reward_shape_window)
+
+        # expose debug
+        self.reward_shape_dbg = {
+            "polarity": "NONE",     # NEG / POS / NONE
+            "r_med": 0.0,
+            "r_sig": 0.0,
+            "score": 0.0,           # [-1, +1] soft
+            "ucb_adj": 0.0,
+            "ent_adj": 0.0,
+        }
+
+    def _ucb_bonus(self, node, action):
+        parent_n = node.visit_count
+        child = node.children.get(action, None)
+        child_n = child.visit_count if child is not None else 0
+        bonus = self.ucb_c * math.sqrt(math.log(parent_n + 1.0) / (child_n + 1.0))
+        return float(bonus)
+
+    def _select_action(self, obs, node):
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        logits = self.policy(obs_t).squeeze(0)
+        act_dim = logits.shape[0]
+
+        bonuses = torch.zeros(act_dim, device=self.device)
+        for a in range(act_dim):
+            bonuses[a] = self._ucb_bonus(node, a)
+        if act_dim > 1:
+            bonuses = (bonuses - bonuses.mean()) / (bonuses.std() + 1e-6)
+
+        shaped_logits = logits + self.ucb_mix * bonuses
+        dist = torch.distributions.Categorical(logits=shaped_logits)
+        action = int(dist.sample().item())
+        logp = dist.log_prob(torch.tensor(action, device=self.device))
+        entropy = dist.entropy()
+        exploration_bonus = float(bonuses[action].item())
+        return action, logp, entropy, exploration_bonus
+
+    def _apply_recovery_boost_strong(self, trigger: bool):
+        # STRONG, dominant: collapse or spike_down
+        if trigger:
+            self.recovery_left = self.crash_boost_steps
+        if self.recovery_left > 0:
+            self.ucb_mix = self.base_ucb_mix + self.ucb_mix_boost
+            self.entropy_coef = self.base_entropy_coef + self.entropy_boost
+            self.recovery_left -= 1
+            return True
+        else:
+            self.ucb_mix = self.base_ucb_mix
+            self.entropy_coef = self.base_entropy_coef
+            return False
+
+    @staticmethod
+    def _robust_stats(arr: np.ndarray):
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        sig = float(1.4826 * mad + 1e-6)
+        return med, sig
+
+    def _apply_reward_polarity_shaping_mild(self, episode_reward: float, strong_recovery_active: bool):
+        """
+        MILD, sub-dominant:
+        - only nudges ucb_mix / entropy_coef slightly
+        - if strong recovery is active, we do NOT override it (just record debug)
+        """
+        self.reward_shape_dbg = {
+            "polarity": "NONE",
+            "r_med": 0.0,
+            "r_sig": 0.0,
+            "score": 0.0,
+            "ucb_adj": 0.0,
+            "ent_adj": 0.0,
+        }
+
+        if (not self.reward_shape_enable) or (strong_recovery_active):
+            # still track rewards for later, but don't change knobs now
+            self._ep_rewards.append(float(episode_reward))
+            return
+
+        self._ep_rewards.append(float(episode_reward))
+        if len(self._ep_rewards) < self.reward_shape_min_episodes:
+            return
+
+        hist = np.array(list(self._ep_rewards), dtype=np.float32)
+        med, sig = self._robust_stats(hist)
+        # soft score: normalize and clamp to [-1, +1]
+        z = (float(episode_reward) - med) / sig
+        score = float(np.tanh(0.6 * z))  # gentle squashing
+
+        # polarity: use *sign of episode_reward* as you asked (+ / -), but scale by score strength
+        polarity = "NEG" if episode_reward < 0.0 else ("POS" if episode_reward > 0.0 else "NONE")
+
+        ucb_adj = 0.0
+        ent_adj = 0.0
+
+        s = self.reward_shape_strength
+        if polarity == "NEG":
+            # negative reward => slightly more exploration
+            ucb_adj = s * self.reward_neg_ucb_boost * (abs(score) if score != 0 else 0.5)
+            ent_adj = s * self.reward_neg_entropy_boost * (abs(score) if score != 0 else 0.5)
+        elif polarity == "POS":
+            # positive reward => slight decay (more exploitation), but keep it mild
+            ucb_adj = -s * self.reward_pos_ucb_decay * (abs(score) if score != 0 else 0.5)
+            ent_adj = -s * self.reward_pos_entropy_decay * (abs(score) if score != 0 else 0.5)
+
+        # apply mild adjustments around base (IMPORTANT: do not accumulate drift)
+        self.ucb_mix = max(0.0, self.base_ucb_mix + ucb_adj)
+        self.entropy_coef = max(0.0, self.base_entropy_coef + ent_adj)
+
+        self.reward_shape_dbg.update({
+            "polarity": polarity,
+            "r_med": float(med),
+            "r_sig": float(sig),
+            "score": float(score),
+            "ucb_adj": float(ucb_adj),
+            "ent_adj": float(ent_adj),
+        })
+
+    def train_episode(self, env, ep_idx=0, seed=None):
+        obs = safe_reset(env, seed=seed)
+
+        logps, entropies, values = [], [], []
+        rewards, actions, exploration_bonuses = [], [], []
+
+        node = self.tree.root
+
+        for t in range(self.max_steps):
+            action, logp, entropy, expl = self._select_action(obs, node)
+            next_obs, reward, done = safe_step(env, action)
+
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            v = self.value(obs_t).squeeze(0)
+
+            actions.append(action)
+            logps.append(logp)
+            entropies.append(entropy)
+            values.append(v)
+            rewards.append(float(reward))
+            exploration_bonuses.append(float(expl))
+
+            node = self.tree.get_or_create_child(node, action)
+            obs = next_obs
+            if done:
+                break
+
+        # Returns
+        returns = []
+        G = 0.0
+        for r in reversed(rewards):
+            G = r + self.gamma * G
+            returns.append(G)
+        returns.reverse()
+        returns_t = torch.tensor(returns, dtype=torch.float32, device=self.device)
+
+        values_t = torch.stack(values)
+        logps_t = torch.stack(logps)
+        ent_t = torch.stack(entropies)
+
+        adv = returns_t - values_t.detach()
+
+        policy_loss = -(logps_t * adv).mean() - self.entropy_coef * ent_t.mean()
+        value_loss = F.mse_loss(values_t, returns_t)
+        loss = policy_loss + self.value_coef * value_loss
+
+        self.policy_optim.zero_grad(set_to_none=True)
+        self.value_optim.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.value.parameters(), 1.0)
+        self.policy_optim.step()
+        self.value_optim.step()
+
+        episode_reward = float(sum(rewards))
+
+        # spike
+        self.spike_detector.update(episode_reward)
+        sp = self.spike_detector.detect()
+
+        # collapse (v8)
+        self.collapse_detector.update(episode_reward)
+        collapsed = self.collapse_detector.detect()
+        stability = self.collapse_detector.get_stability()
+        collapse_reason = self.collapse_detector.last_reason
+        cdbg = dict(self.collapse_detector.debug)
+
+        # STRONG recovery trigger: collapse or spike_down (dominant)
+        trigger_recovery = collapsed or sp["is_spike_down"]
+        strong_active = self._apply_recovery_boost_strong(trigger_recovery)
+
+        # MILD reward polarity shaping (sub-dominant)
+        self._apply_reward_polarity_shaping_mild(episode_reward, strong_recovery_active=strong_active)
+
+        # tree update
+        path = self.tree.record_episode(actions)
+        self.tree.update_path_with_returns(path, returns)
+        tree_stats = self.tree.stats()
+
+        return {
+            "episode_reward": episode_reward,
+            "is_collapsed": bool(collapsed),
+            "collapse_reason": str(collapse_reason),
+            "collapse_dbg": cdbg,
+            "stability": float(stability),
+            "tree_stats": tree_stats,
+            "exploration_bonus": float(np.mean(exploration_bonuses)) if exploration_bonuses else 0.0,
+            "spike": sp,
+            "all_time_avg": float(self.collapse_detector.all_time_avg),
+            "best_ewma": float(self.collapse_detector.best_ewma),
+            "reward_shape_dbg": dict(self.reward_shape_dbg),
+            "strong_recovery_active": bool(strong_active),
+        }
+
+
+# ============================================================
+# 6) Main
+# ============================================================
+def main():
+    seed_everything(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = gym.make("CartPole-v1")
+
+    policy = PolicyNetwork(obs_dim=4, act_dim=2, hidden=128).to(device)
+    value = ValueNetwork(obs_dim=4, hidden=128).to(device)
+
+    optim_policy = torch.optim.Adam(policy.parameters(), lr=3e-4)
+    optim_value = torch.optim.Adam(value.parameters(), lr=1e-3)
+
+    trainer = TreeBasedPolicyTrainer(
+        policy, value, optim_policy, optim_value, device,
+        tree_depth=500,
+        gamma=0.99,
+        entropy_coef=0.01,
+        value_coef=0.5,
+        ucb_c=1.5,
+        ucb_mix=0.35,
+        max_steps=500,
+
+        crash_boost_steps=3,
+        ucb_mix_boost=0.25,
+        entropy_boost=0.02,
+
+        # reward polarity shaping (MILD)
+        reward_shape_enable=True,
+        reward_shape_window=30,
+        reward_shape_min_episodes=10,
+        reward_shape_strength=0.25,
+        reward_neg_ucb_boost=0.10,
+        reward_neg_entropy_boost=0.008,
+        reward_pos_ucb_decay=0.06,
+        reward_pos_entropy_decay=0.004,
+    )
+
+    history = {
+        "reward": [], "delta_reward": [], "spike_up": [], "spike_down": [],
+        "collapsed": [], "polarity": [], "strong": []
+    }
+
+    print("=" * 235)
+    print("Starting Tree-Based Learning with Collapse(v8: Drawdown+TrimmedRobust) & Spike(v5: LEVEL+JUMP) + RewardPolarityShaping(MILD)")
+    print("=" * 235)
+    print(
+        f"{'Ep':>3} | {'Status':^12} | {'Reward':>8} | {'DeltaR':>8} | "
+        f"{'Avg10':>8} | {'Avg20':>8} | {'AllAvg':>8} | {'BestEWMA':>8} | {'Stability':>9} | "
+        f"{'TreeNodes':>9} | {'TreeDepth':>9} | {'Explr(B)':>9} | "
+        f"{'zR':>6} | {'zΔ':>6} | {'Δ':>7} | {'DynAbsΔ':>7} | {'σΔ':>7} | "
+        f"{'BaseMed':>7} | {'Kind':>8} | {'P95':>6} | "
+        f"{'Peak90':>7} | {'DD':>7} | {'DynAbs':>7} | {'P30':>6} | {'dThr':>6} | "
+        f"{'Pol':>3} | {'S?':>2} | {'uAdj':>6} | {'eAdj':>6} | {'CollapseReason':>26}"
+    )
+    print("-" * 235)
+
+    for ep in range(200):
+        m = trainer.train_episode(env, ep_idx=ep, seed=None)
+        r = m["episode_reward"]
+        history["reward"].append(r)
+
+        dr = r - history["reward"][-2] if ep > 0 else 0.0
+        history["delta_reward"].append(dr)
+
+        avg10 = float(np.mean(history["reward"][-10:]))
+        avg20 = float(np.mean(history["reward"][-20:]))
+
+        sp = m["spike"]
+        history["spike_up"].append(sp["is_spike_up"])
+        history["spike_down"].append(sp["is_spike_down"])
+        history["collapsed"].append(m["is_collapsed"])
+
+        rs = m["reward_shape_dbg"]
+        history["polarity"].append(rs.get("polarity", "NONE"))
+        history["strong"].append(m.get("strong_recovery_active", False))
+
+        if m["is_collapsed"]:
+            status = "[COLLAPSE]"
+        else:
+            if sp["is_spike_up"]:
+                status = "[SPIKE+]"
+            elif sp["is_spike_down"]:
+                status = "[SPIKE-]"
+            else:
+                status = "[Normal]"
+
+        cdbg = m["collapse_dbg"]
+        peak = cdbg.get("peak", 0.0)
+        dd = cdbg.get("dd", 0.0)
+        dyn_abs = cdbg.get("dyn_abs", 0.0)
+        p_low = cdbg.get("p_low", 0.0)
+        dthr = cdbg.get("delta_thr", 0.0)
+
+        pol = rs.get("polarity", "NONE")
+        pol3 = "NEG" if pol == "NEG" else ("POS" if pol == "POS" else "---")
+        strong2 = "Y" if m.get("strong_recovery_active", False) else "N"
+        uAdj = rs.get("ucb_adj", 0.0)
+        eAdj = rs.get("ent_adj", 0.0)
+
+        print(
+            f"{ep:3d} | {status:^12} | {r:8.1f} | {dr:+8.1f} | "
+            f"{avg10:8.1f} | {avg20:8.1f} | {m['all_time_avg']:8.1f} | {m['best_ewma']:8.1f} | {m['stability']:9.3f} | "
+            f"{m['tree_stats']['total_nodes']:9d} | {m['tree_stats']['max_depth']:9d} | {m['exploration_bonus']:9.3f} | "
+            f"{sp['z_r']:6.2f} | {sp['z_d']:6.2f} | {sp['delta']:+7.1f} | {sp['dyn_abs_delta']:7.2f} | {sp['sigma_d']:7.2f} | "
+            f"{sp['base_med']:7.1f} | {sp['kind']:>8} | {sp['p_hi_val']:6.1f} | "
+            f"{peak:7.1f} | {dd:7.1f} | {dyn_abs:7.1f} | {p_low:6.1f} | {dthr:6.1f} | "
+            f"{pol3:>3} | {strong2:>2} | {uAdj:6.3f} | {eAdj:6.4f} | {m['collapse_reason']:>26}"
+        )
+
+        if (ep + 1) % 10 == 0:
+            print("-" * 235)
+            last10 = history["reward"][-10:]
+            spikes_up_10 = sum(history["spike_up"][-10:])
+            spikes_dn_10 = sum(history["spike_down"][-10:])
+            collapses10 = sum(history["collapsed"][-10:])
+            avg_delta = float(np.mean(history["delta_reward"][-10:]))
+            trend = "UP" if avg_delta > 0 else "DOWN"
+            neg10 = sum(1 for p in history["polarity"][-10:] if p == "NEG")
+            pos10 = sum(1 for p in history["polarity"][-10:] if p == "POS")
+            strong10 = sum(1 for s in history["strong"][-10:] if s)
+
+            print(
+                f"[Ep {ep+1:03d}] AvgRwd:{float(np.mean(last10)):6.1f} | StdDev:{float(np.std(last10)):7.2f} | "
+                f"Trend:{trend} ({avg_delta:+.2f}) | Collapses:{collapses10}/10 | "
+                f"SpikesUp:{spikes_up_10}/10 | SpikesDn:{spikes_dn_10}/10 | "
+                f"Pol NEG:{neg10}/10 POS:{pos10}/10 | StrongRec:{strong10}/10 | "
+                f"AllTimeAvg:{m['all_time_avg']:6.1f} | BestEWMA:{m['best_ewma']:6.1f} | TreeNodes:{m['tree_stats']['total_nodes']}"
+            )
+            print("-" * 235)
+
+    print("=" * 235)
+    print("Training Complete!")
+    print("=" * 235)
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
